@@ -82,10 +82,11 @@ enum class AutoCountSensitivity(
     val stillMovement: Float,
     val pickupTiltXY: Float,
     val pickupMovement: Float,
+    val requiredVerticalMoveMeters: Float,
 ) {
-    LOW("低", 900L, 450L, 1200L, 2.4f, 0.75f, 4.5f, 2.2f),
-    MEDIUM("中", 700L, 350L, 900L, 3.1f, 1.0f, 5.2f, 2.7f),
-    HIGH("高", 500L, 250L, 650L, 3.8f, 1.25f, 6.0f, 3.2f),
+    LOW("低", 1300L, 650L, 1600L, 1.7f, 0.55f, 3.7f, 1.7f, 0.15f),
+    MEDIUM("中", 1050L, 500L, 1300L, 2.1f, 0.7f, 4.3f, 2.1f, 0.12f),
+    HIGH("高", 850L, 400L, 1000L, 2.5f, 0.9f, 5.0f, 2.5f, 0.10f),
 }
 
 object SetCounterStore {
@@ -96,6 +97,8 @@ object SetCounterStore {
     var overlayEnabled by mutableStateOf(false)
         private set
     var fluidCloudEnabled by mutableStateOf(false)
+        private set
+    var debugStatusEnabled by mutableStateOf(false)
         private set
     var restDurationSeconds by mutableIntStateOf(60)
         private set
@@ -113,6 +116,7 @@ object SetCounterStore {
         autoCountEnabled = prefs.getBoolean("auto_count_enabled", autoCountEnabled)
         overlayEnabled = prefs.getBoolean("overlay_enabled", overlayEnabled)
         fluidCloudEnabled = prefs.getBoolean("fluid_cloud_enabled", fluidCloudEnabled)
+        debugStatusEnabled = prefs.getBoolean("debug_status_enabled", debugStatusEnabled)
         restDurationSeconds = prefs.getInt("rest_duration_seconds", restDurationSeconds)
         sensitivity = runCatching {
             AutoCountSensitivity.valueOf(prefs.getString("sensitivity", sensitivity.name) ?: sensitivity.name)
@@ -165,6 +169,12 @@ object SetCounterStore {
         notifyChanged()
     }
 
+    fun updateDebugStatusEnabled(enabled: Boolean) {
+        debugStatusEnabled = enabled
+        preferences?.edit()?.putBoolean("debug_status_enabled", enabled)?.apply()
+        notifyChanged()
+    }
+
     fun updateRestDurationSeconds(seconds: Int) {
         restDurationSeconds = seconds
         preferences?.edit()?.putInt("rest_duration_seconds", seconds)?.apply()
@@ -200,8 +210,33 @@ object AutoCountSensorController : SensorEventListener {
         RESTING,
     }
 
+    private class MovementWindow(private val maxSize: Int) {
+        private val values = ArrayDeque<Float>()
+        var average = 0f
+            private set
+        var peak = 0f
+            private set
+
+        fun clear() {
+            values.clear()
+            average = 0f
+            peak = 0f
+        }
+
+        fun add(value: Float) {
+            values += value
+            if (values.size > maxSize) values.removeFirst()
+            average = values.average().toFloat()
+            peak = values.maxOrNull() ?: 0f
+        }
+    }
+
+    var debugStatusText by mutableStateOf("状态：IDLE")
+        private set
+
     private var sensorManager: SensorManager? = null
     private var accelerometer: Sensor? = null
+    private var gravitySensor: Sensor? = null
     private val activeClients = mutableSetOf<String>()
 
     private var state = DetectionState.IDLE
@@ -210,10 +245,18 @@ object AutoCountSensorController : SensorEventListener {
     private var lowX = 0f
     private var lowY = 0f
     private var lowZ = 0f
+    private var gravityX = 0f
+    private var gravityY = 0f
+    private var gravityZ = 0f
+    private var hasGravitySample = false
     private var lastRawX = 0f
     private var lastRawY = 0f
     private var lastRawZ = 0f
+    private var lastSampleTimeMillis = 0L
+    private var verticalVelocity = 0f
+    private var verticalDisplacement = 0f
     private var hasLastSample = false
+    private val movementWindow = MovementWindow(maxSize = 12)
 
     fun hasAccelerometer(context: Context): Boolean {
         val manager = context.applicationContext.getSystemService(Context.SENSOR_SERVICE) as SensorManager
@@ -233,23 +276,36 @@ object AutoCountSensorController : SensorEventListener {
         val appContext = context.applicationContext
         val manager = (sensorManager ?: appContext.getSystemService(Context.SENSOR_SERVICE) as SensorManager)
             .also { sensorManager = it }
-        val sensor = accelerometer ?: manager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+        val accelerometerSensor = accelerometer ?: manager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
             .also { accelerometer = it }
+        val gravity = gravitySensor ?: manager.getDefaultSensor(Sensor.TYPE_GRAVITY)
+            .also { gravitySensor = it }
 
         manager.unregisterListener(this)
-        if (SetCounterStore.autoCountEnabled && activeClients.isNotEmpty() && sensor != null) {
-            manager.registerListener(this, sensor, SensorManager.SENSOR_DELAY_UI)
+        if (SetCounterStore.autoCountEnabled && activeClients.isNotEmpty() && accelerometerSensor != null) {
+            gravity?.let { manager.registerListener(this, it, SensorManager.SENSOR_DELAY_UI) }
+            manager.registerListener(this, accelerometerSensor, SensorManager.SENSOR_DELAY_UI)
         } else {
             resetDetectionState()
         }
     }
 
     override fun onSensorChanged(event: SensorEvent) {
-        if ((!SetCounterStore.autoCountEnabled) || event.sensor.type != Sensor.TYPE_ACCELEROMETER) return
+        if (!SetCounterStore.autoCountEnabled) return
+
+        if (event.sensor.type == Sensor.TYPE_GRAVITY) {
+            gravityX = event.values[0]
+            gravityY = event.values[1]
+            gravityZ = event.values[2]
+            hasGravitySample = true
+            return
+        }
+        if (event.sensor.type != Sensor.TYPE_ACCELEROMETER) return
 
         val now = System.currentTimeMillis()
         if (SetCounterStore.isResting) {
             transitionTo(DetectionState.RESTING, now)
+            debugStatusText = "状态：RESTING，剩余 ${((SetCounterStore.remainingRestMillis() + 999L) / 1000L)}s"
             return
         }
         if (state == DetectionState.RESTING) {
@@ -260,25 +316,41 @@ object AutoCountSensorController : SensorEventListener {
         val rawY = event.values[1]
         val rawZ = event.values[2]
         applyLowPass(rawX, rawY, rawZ)
+        val poseX = if (hasGravitySample) gravityX else lowX
+        val poseY = if (hasGravitySample) gravityY else lowY
+        val poseZ = if (hasGravitySample) gravityZ else lowZ
 
         val rawMagnitude = sqrt(rawX * rawX + rawY * rawY + rawZ * rawZ)
-        val filteredXy = sqrt(lowX * lowX + lowY * lowY)
+        val filteredXy = sqrt(poseX * poseX + poseY * poseY)
         val rawMovement = if (hasLastSample) {
             abs(rawX - lastRawX) + abs(rawY - lastRawY) + abs(rawZ - lastRawZ)
         } else {
             Float.MAX_VALUE
         }
+        movementWindow.add(rawMovement)
+        updateVerticalDisplacement(now, rawX, rawY, rawZ, poseX, poseY, poseZ)
         lastRawX = rawX
         lastRawY = rawY
         lastRawZ = rawZ
+        lastSampleTimeMillis = now
         hasLastSample = true
 
         val sensitivity = SetCounterStore.sensitivity
-        val isMagnitudeNormal = rawMagnitude in 8.0f..11.6f
-        val isHorizontallyPlaced = abs(lowZ) > 8.7f && filteredXy < sensitivity.maxTiltXY
-        val isStill = rawMovement < sensitivity.stillMovement
-        val putDownCandidate = isMagnitudeNormal && isHorizontallyPlaced && isStill
-        val pickupCandidate = !isHorizontallyPlaced || filteredXy > sensitivity.pickupTiltXY || rawMovement > sensitivity.pickupMovement
+        val isMagnitudeNormal = rawMagnitude in 8.4f..11.1f
+        val isHorizontallyPlaced = abs(poseZ) > 9.15f && filteredXy < sensitivity.maxTiltXY
+        val isStill = movementWindow.average < sensitivity.stillMovement && movementWindow.peak < sensitivity.stillMovement * 2.2f
+        val movedDownEnough = verticalDisplacement <= -sensitivity.requiredVerticalMoveMeters
+        val movedUpEnough = verticalDisplacement >= sensitivity.requiredVerticalMoveMeters
+        val putDownCandidate = isMagnitudeNormal && isHorizontallyPlaced && isStill && movedDownEnough
+        val postureChangedForPickup = abs(poseZ) < 8.0f || filteredXy > sensitivity.pickupTiltXY
+        val pickupCandidate = postureChangedForPickup &&
+            movementWindow.average > sensitivity.stillMovement &&
+            movementWindow.peak > sensitivity.pickupMovement &&
+            movedUpEnough
+
+        if (SetCounterStore.debugStatusEnabled) {
+            debugStatusText = "状态：$state | 水平=$isHorizontallyPlaced 静止=$isStill 下移=$movedDownEnough 上移=$movedUpEnough 平均移动=${"%.2f".format(movementWindow.average)} 峰值=${"%.2f".format(movementWindow.peak)}"
+        }
 
         when (state) {
             DetectionState.IDLE -> {
@@ -289,6 +361,7 @@ object AutoCountSensorController : SensorEventListener {
                     !putDownCandidate -> transitionTo(DetectionState.IDLE, now)
                     now - stateStartTime >= sensitivity.requiredPutDownMillis -> {
                         confirmedPutDownTime = now
+                        resetVerticalMotion()
                         transitionTo(DetectionState.PUT_DOWN_CONFIRMED, now)
                     }
                 }
@@ -300,7 +373,10 @@ object AutoCountSensorController : SensorEventListener {
             }
             DetectionState.MAYBE_PICKUP -> {
                 when {
-                    putDownCandidate -> transitionTo(DetectionState.PUT_DOWN_CONFIRMED, now)
+                    putDownCandidate -> {
+                        resetVerticalMotion()
+                        transitionTo(DetectionState.PUT_DOWN_CONFIRMED, now)
+                    }
                     !pickupCandidate -> transitionTo(DetectionState.PUT_DOWN_CONFIRMED, now)
                     now - stateStartTime >= sensitivity.requiredPickupMillis -> {
                         SetCounterStore.increment(startRest = true)
@@ -315,7 +391,7 @@ object AutoCountSensorController : SensorEventListener {
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
 
     private fun applyLowPass(rawX: Float, rawY: Float, rawZ: Float) {
-        val alpha = 0.18f
+        val alpha = 0.12f
         if (!hasLastSample) {
             lowX = rawX
             lowY = rawY
@@ -327,10 +403,45 @@ object AutoCountSensorController : SensorEventListener {
         }
     }
 
+    private fun updateVerticalDisplacement(
+        now: Long,
+        rawX: Float,
+        rawY: Float,
+        rawZ: Float,
+        poseX: Float,
+        poseY: Float,
+        poseZ: Float,
+    ) {
+        if (!hasLastSample || lastSampleTimeMillis == 0L) return
+        val dt = ((now - lastSampleTimeMillis) / 1000f).coerceIn(0.005f, 0.08f)
+        val gravityMagnitude = sqrt(poseX * poseX + poseY * poseY + poseZ * poseZ).coerceAtLeast(0.1f)
+        val unitX = poseX / gravityMagnitude
+        val unitY = poseY / gravityMagnitude
+        val unitZ = poseZ / gravityMagnitude
+        val linearX = rawX - poseX
+        val linearY = rawY - poseY
+        val linearZ = rawZ - poseZ
+        val verticalAcceleration = linearX * unitX + linearY * unitY + linearZ * unitZ
+        if (abs(verticalAcceleration) < 0.25f) {
+            verticalVelocity *= 0.82f
+        } else {
+            verticalVelocity = (verticalVelocity + verticalAcceleration * dt).coerceIn(-1.2f, 1.2f)
+            verticalDisplacement = (verticalDisplacement + verticalVelocity * dt).coerceIn(-0.5f, 0.5f)
+        }
+    }
+
+    private fun resetVerticalMotion() {
+        verticalVelocity = 0f
+        verticalDisplacement = 0f
+    }
+
     private fun transitionTo(newState: DetectionState, now: Long) {
         if (state != newState) {
             state = newState
             stateStartTime = now
+            if (SetCounterStore.debugStatusEnabled) {
+                debugStatusText = "状态：$newState"
+            }
         }
     }
 
@@ -341,9 +452,17 @@ object AutoCountSensorController : SensorEventListener {
         lowX = 0f
         lowY = 0f
         lowZ = 0f
+        gravityX = 0f
+        gravityY = 0f
+        gravityZ = 0f
+        hasGravitySample = false
+        debugStatusText = "状态：IDLE"
         lastRawX = 0f
         lastRawY = 0f
         lastRawZ = 0f
+        lastSampleTimeMillis = 0L
+        resetVerticalMotion()
+        movementWindow.clear()
         hasLastSample = false
     }
 }
@@ -398,6 +517,8 @@ fun SetReporterScreen(
     val autoEnabled = SetCounterStore.autoCountEnabled
     val overlayEnabled = SetCounterStore.overlayEnabled
     val fluidCloudEnabled = SetCounterStore.fluidCloudEnabled
+    val debugStatusEnabled = SetCounterStore.debugStatusEnabled
+    val debugStatusText = AutoCountSensorController.debugStatusText
     val restDurationSeconds = SetCounterStore.restDurationSeconds
     val sensitivity = SetCounterStore.sensitivity
     var showCustomRestDialog by remember { mutableStateOf(false) }
@@ -412,6 +533,15 @@ fun SetReporterScreen(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
+        if (debugStatusEnabled) {
+            Text(
+                text = debugStatusText,
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 8.dp),
+            )
+        }
         Text(
             text = "Sets Reporter",
             style = MaterialTheme.typography.headlineMedium,
@@ -454,6 +584,12 @@ fun SetReporterScreen(
                 SetCounterStore.updateAutoCountEnabled(it)
                 AutoCountSensorController.refresh(context)
             }
+        )
+        SettingRow(
+            title = "状态显示",
+            subtitle = "调试用：在页面顶部显示自动计数状态和判定数据",
+            checked = debugStatusEnabled,
+            onCheckedChange = { SetCounterStore.updateDebugStatusEnabled(it) },
         )
         SettingRow(
             title = "悬浮窗",
@@ -647,15 +783,12 @@ class CounterOverlayService : android.app.Service() {
     private lateinit var windowManager: WindowManager
     private var overlayView: LinearLayout? = null
     private var countText: TextView? = null
-    private var actionMenu: LinearLayout? = null
+
     private var restText: TextView? = null
     private var restEndButton: TextView? = null
     private var expanded = false
 
     private val collapsedSize by lazy { dp(52) }
-    private val expandedWidth by lazy { dp(58) }
-    private val expandedHeight by lazy { dp(216) }
-    private val actionButtonSize by lazy { dp(42) }
     private val touchSlop by lazy { dp(6) }
     private val updateListener = { updateCountText() }
     private val restTicker = object : Runnable {
@@ -672,6 +805,7 @@ class CounterOverlayService : android.app.Service() {
     private var startX = 0
     private var startY = 0
     private var dragging = false
+    private var lastTapTimeMillis = 0L
 
     override fun onCreate() {
         super.onCreate()
@@ -716,40 +850,20 @@ class CounterOverlayService : android.app.Service() {
             gravity = Gravity.CENTER
             setTypeface(typeface, android.graphics.Typeface.BOLD)
         }
-        actionMenu = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER
-            visibility = View.GONE
-        }
-
         restText = TextView(this).apply {
             textSize = 10f
             setTextColor(0xFFFFD54F.toInt())
             gravity = Gravity.CENTER
             setTypeface(typeface, android.graphics.Typeface.BOLD)
         }
-        val plus = actionButton("+1") {
-            SetCounterStore.increment()
-            collapse()
-        }
-        val minus = actionButton("-1") {
-            SetCounterStore.decrement()
-            collapse()
-        }
-        val reset = actionButton("清") {
-            SetCounterStore.reset()
-            collapse()
-        }
-        restEndButton = actionButton("停") {
-            SetCounterStore.endRest()
-            AutoCountSensorController.refresh(this)
-            collapse()
+        restEndButton = TextView(this).apply {
+            text = "长按结束休息"
+            textSize = 10f
+            setTextColor(0xFFFFD54F.toInt())
+            gravity = Gravity.CENTER
+            visibility = View.GONE
         }
 
-        actionMenu?.addView(plus)
-        actionMenu?.addView(minus)
-        actionMenu?.addView(reset)
-        actionMenu?.addView(restEndButton)
         container.addView(
             countText,
             LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.MATCH_PARENT)
@@ -762,7 +876,13 @@ class CounterOverlayService : android.app.Service() {
                 topMargin = -dp(18)
             }
         )
-        container.addView(actionMenu)
+        container.addView(restEndButton)
+        container.setOnLongClickListener {
+            SetCounterStore.endRest()
+            AutoCountSensorController.refresh(this)
+            updateCountText()
+            true
+        }
         container.setOnTouchListener { _, event -> handleTouch(event) }
 
         val params = WindowManager.LayoutParams(
@@ -809,7 +929,17 @@ class CounterOverlayService : android.app.Service() {
                 return true
             }
             android.view.MotionEvent.ACTION_UP -> {
-                if (!dragging) toggleExpanded()
+                if (!dragging) {
+                    val now = System.currentTimeMillis()
+                    if (now - lastTapTimeMillis <= 350L) {
+                        SetCounterStore.reset()
+                        lastTapTimeMillis = 0L
+                    } else {
+                        SetCounterStore.increment()
+                        lastTapTimeMillis = now
+                    }
+                    collapse()
+                }
                 dragging = false
                 return true
             }
@@ -817,27 +947,10 @@ class CounterOverlayService : android.app.Service() {
         return false
     }
 
-    private fun toggleExpanded() {
-        if (expanded) collapse() else expand()
-    }
-
-    private fun expand() {
-        expanded = true
-        overlayView?.background = roundedBackground()
-        actionMenu?.visibility = View.VISIBLE
-        restEndButton?.visibility = if (SetCounterStore.isResting) View.VISIBLE else View.GONE
-        countText?.layoutParams = LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            dp(44)
-        )
-        val height = if (SetCounterStore.isResting) expandedHeight + dp(50) else expandedHeight
-        updateOverlaySize(expandedWidth, height)
-    }
-
     private fun collapse() {
         expanded = false
         overlayView?.background = circleBackground()
-        actionMenu?.visibility = View.GONE
+        restEndButton?.visibility = if (SetCounterStore.isResting) View.VISIBLE else View.GONE
         countText?.layoutParams = LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
             LinearLayout.LayoutParams.MATCH_PARENT
@@ -853,23 +966,6 @@ class CounterOverlayService : android.app.Service() {
         params.x = params.x.coerceIn(0, screenWidth() - width)
         params.y = params.y.coerceIn(0, screenHeight() - height)
         windowManager.updateViewLayout(view, params)
-    }
-
-    private fun actionButton(label: String, onClick: () -> Unit) = TextView(this).apply {
-        text = label
-        textSize = 14f
-        setTextColor(Color.WHITE)
-        gravity = Gravity.CENTER
-        setTypeface(typeface, android.graphics.Typeface.BOLD)
-        background = GradientDrawable().apply {
-            shape = GradientDrawable.OVAL
-            setColor(0xDD3F51B5.toInt())
-        }
-        setOnClickListener { onClick() }
-        layoutParams = LinearLayout.LayoutParams(actionButtonSize, actionButtonSize).apply {
-            topMargin = dp(4)
-            bottomMargin = dp(4)
-        }
     }
 
     private fun updateCountText() {
@@ -888,21 +984,13 @@ class CounterOverlayService : android.app.Service() {
             restText?.visibility = View.GONE
             restText?.text = ""
         }
-        restEndButton?.visibility = if (expanded && SetCounterStore.isResting) View.VISIBLE else View.GONE
-        if (expanded) updateOverlaySize(expandedWidth, if (SetCounterStore.isResting) expandedHeight + dp(50) else expandedHeight)
+        restEndButton?.visibility = if (SetCounterStore.isResting) View.VISIBLE else View.GONE
     }
 
     private fun circleBackground() = GradientDrawable().apply {
         shape = GradientDrawable.OVAL
         setColor(0x88222222.toInt())
         setStroke(dp(1), 0x55FFFFFF)
-    }
-
-    private fun roundedBackground() = GradientDrawable().apply {
-        shape = GradientDrawable.RECTANGLE
-        cornerRadius = dp(29).toFloat()
-        setColor(0xBB222222.toInt())
-        setStroke(dp(1), 0x44FFFFFF)
     }
 
     private fun screenWidth(): Int = resources.displayMetrics.widthPixels
